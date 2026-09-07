@@ -4,3 +4,5 @@ yfinance
 pandas
 numpy
 requests
+gspread
+google-auth
