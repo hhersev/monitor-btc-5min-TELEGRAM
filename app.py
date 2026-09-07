@@ -45,13 +45,20 @@ que siga activa en ese momento. Es un mal menor asumible.
 """
 
 import os
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 from flask import Flask, request
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
 
 # --------------------------------------------------------------------------
 # CONFIGURACIÓN (parámetros validados)
@@ -75,6 +82,14 @@ FUNDING_EXTREME_PCTL = 0.90
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 CRON_SECRET = os.environ.get("CRON_SECRET")  # opcional
+
+# Google Sheets: ID de la hoja y credenciales del robot (cuenta de servicio).
+# GOOGLE_CREDENTIALS_JSON contiene el CONTENIDO del archivo .json (pegado como
+# variable de entorno en Render). SHEET_ID es el identificador de la hoja (de su URL).
+SHEET_ID = os.environ.get("SHEET_ID")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+SHEET_TAB = "Avisos"
+HORIZON_DIAS = 10   # días que se sigue una señal pendiente antes de marcarla "sin resolver"
 
 # Estado en memoria: recuerda las señales ya avisadas (por su zona) para no repetir,
 # pero SIN límite de cuántas al día. Guardamos las claves de señal ya notificadas.
@@ -295,6 +310,7 @@ def do_check() -> str:
                 return "confirmada de esta señal ya avisada, se omite"
             send_telegram(format_message(res, "🔔 SEÑAL DE ENTRADA CONFIRMADA"))
             STATE["confirmadas_avisadas"].add(signal_key)
+            guardar_aviso(res, signal_key)  # guardar en el histórico de Google Sheets
             return "confirmada enviada"
 
     elif res["status"] == "en_acumulacion":
@@ -306,6 +322,114 @@ def do_check() -> str:
     elif res["status"] == "datos_insuficientes":
         return f"datos insuficientes: {res.get('detail','')}"
     return "sin patrón relevante"
+
+
+# --------------------------------------------------------------------------
+# GOOGLE SHEETS: guardar avisos y seguir su resultado (TP/SL)
+# --------------------------------------------------------------------------
+def get_sheet():
+    """Conecta con la hoja de Google. Devuelve el objeto worksheet o None si
+    no está configurado / falla."""
+    if gspread is None:
+        log("[AVISO] Falta gspread; no se puede usar Google Sheets.")
+        return None
+    if not (SHEET_ID and GOOGLE_CREDENTIALS_JSON):
+        log("[AVISO] Faltan SHEET_ID o GOOGLE_CREDENTIALS_JSON. No se guarda histórico.")
+        return None
+    try:
+        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+    except Exception as e:
+        log(f"[ERROR] No se pudo conectar con Google Sheets: {e}")
+        return None
+
+
+def guardar_aviso(res: dict, signal_key: str):
+    """Añade una fila a la hoja con el aviso confirmado (resultado 'Pendiente')."""
+    ws = get_sheet()
+    if ws is None:
+        return
+    try:
+        fila = [
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "Confirmada",
+            signal_key,
+            f"{res['zone_low']}-{res['zone_high']}",
+            res["entry"], res["tp"], res["sl"],
+            "Pendiente", "",
+        ]
+        ws.append_row(fila, value_input_option="USER_ENTERED")
+        log(f"Aviso guardado en Google Sheets (ID {signal_key}).")
+    except Exception as e:
+        log(f"[ERROR] No se pudo guardar el aviso en Google Sheets: {e}")
+
+
+def actualizar_pendientes():
+    """Revisa las filas 'Pendiente' y comprueba, con el histórico de precios,
+    si desde la fecha del aviso el precio tocó antes el TP o el SL."""
+    ws = get_sheet()
+    if ws is None:
+        return
+    try:
+        registros = ws.get_all_values()  # incluye la cabecera en la fila 1
+    except Exception as e:
+        log(f"[ERROR] No se pudieron leer las filas: {e}")
+        return
+
+    if len(registros) < 2:
+        return  # solo cabecera
+
+    # Descargar histórico de precios 5m una sola vez (cubre ~60 días)
+    try:
+        precios = yf.download(TICKER, interval="5m", period=PERIOD, progress=False)
+        if isinstance(precios.columns, pd.MultiIndex):
+            precios.columns = precios.columns.get_level_values(0)
+        precios = precios.rename(columns={"High": "high", "Low": "low"})
+        if precios.index.tz is None:
+            precios.index = precios.index.tz_localize("UTC")
+    except Exception as e:
+        log(f"[ERROR] No se pudo descargar histórico para seguir pendientes: {e}")
+        return
+
+    for i, fila in enumerate(registros[1:], start=2):  # start=2: fila real en la hoja
+        try:
+            if len(fila) < 8 or fila[7] != "Pendiente":
+                continue
+            fecha_aviso = datetime.strptime(fila[0], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            entry = float(fila[4]); tp = float(fila[5]); sl = float(fila[6])
+
+            ventana = precios[precios.index >= fecha_aviso]
+            if ventana.empty:
+                continue
+
+            resultado = None
+            for ts, row in ventana.iterrows():
+                hi = float(row["high"]); lo = float(row["low"])
+                hit_tp = hi >= tp
+                hit_sl = lo <= sl
+                if hit_tp and hit_sl:
+                    resultado = "SL"; fecha_res = ts; break  # misma vela: conservador -> SL
+                elif hit_tp:
+                    resultado = "TP"; fecha_res = ts; break
+                elif hit_sl:
+                    resultado = "SL"; fecha_res = ts; break
+
+            if resultado is None:
+                # ¿Ha pasado ya el horizonte de seguimiento sin resolverse?
+                if datetime.now(timezone.utc) - fecha_aviso > timedelta(days=HORIZON_DIAS):
+                    ws.update_cell(i, 8, "Sin resolver")
+                    ws.update_cell(i, 9, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                continue
+
+            ws.update_cell(i, 8, "TP" if resultado == "TP" else "SL")
+            ws.update_cell(i, 9, fecha_res.strftime("%Y-%m-%d"))
+            log(f"Pendiente resuelto (fila {i}): {resultado}")
+        except Exception as e:
+            log(f"[AVISO] No se pudo procesar la fila {i}: {e}")
+            continue
 
 
 # --------------------------------------------------------------------------
@@ -325,11 +449,30 @@ def check():
             return "no autorizado", 403
     try:
         resultado = do_check()
+        # Tras comprobar el mercado, actualizar el resultado (TP/SL) de los avisos
+        # pendientes en el histórico. Se hace en cada llamada; es ligero.
+        try:
+            actualizar_pendientes()
+        except Exception as e:
+            log(f"[AVISO] Fallo al actualizar pendientes: {e}")
         log(f"Comprobación: {resultado}")
         return f"ok: {resultado}", 200
     except Exception as e:
         log(f"[ERROR] {e}")
         return f"error: {e}", 500
+
+
+@app.route("/test")
+def test():
+    # Envía un mensaje de prueba a Telegram, para confirmar que la notificación
+    # llega bien al móvil sin esperar a una señal real de mercado.
+    send_telegram(
+        "✅ Prueba del monitor BTC/EUR.\n\n"
+        "Si ves este mensaje, Telegram está configurado correctamente y "
+        "recibirás aquí los avisos de señal (provisional y confirmada).\n\n"
+        "Puedes ignorar este mensaje de prueba."
+    )
+    return "Mensaje de prueba enviado a Telegram. Revisa tu móvil.", 200
 
 
 if __name__ == "__main__":
