@@ -438,6 +438,65 @@ def actualizar_pendientes():
 # --------------------------------------------------------------------------
 # RUTAS WEB
 # --------------------------------------------------------------------------
+@app.route("/diag")
+def diag():
+    """Diagnóstico de la conexión con Google Sheets. Devuelve en texto claro
+    qué está fallando, en vez de un volcado ilegible."""
+    lineas = []
+    # 1. ¿Están las variables?
+    lineas.append(f"SHEET_ID presente: {'sí' if SHEET_ID else 'NO'}")
+    if SHEET_ID:
+        lineas.append(f"  SHEET_ID = '{SHEET_ID}'")
+        lineas.append(f"  longitud: {len(SHEET_ID)} caracteres")
+        if "/" in SHEET_ID or "http" in SHEET_ID or "edit" in SHEET_ID:
+            lineas.append("  ⚠️ PROBLEMA: el SHEET_ID contiene '/', 'http' o 'edit'. "
+                          "Debe ser SOLO la cadena de en medio de la URL, sin nada más.")
+    lineas.append(f"GOOGLE_CREDENTIALS_JSON presente: {'sí' if GOOGLE_CREDENTIALS_JSON else 'NO'}")
+    if GOOGLE_CREDENTIALS_JSON:
+        lineas.append(f"  longitud: {len(GOOGLE_CREDENTIALS_JSON)} caracteres")
+        # ¿Es JSON válido?
+        try:
+            info = json.loads(GOOGLE_CREDENTIALS_JSON)
+            lineas.append("  JSON válido: sí")
+            lineas.append(f"  client_email en el JSON: {info.get('client_email', 'NO ENCONTRADO')}")
+            lineas.append(f"  project_id: {info.get('project_id', 'NO ENCONTRADO')}")
+            lineas.append("  --> Comparte la hoja con ese client_email como Editor si no lo has hecho.")
+        except Exception as e:
+            lineas.append(f"  ⚠️ PROBLEMA: el JSON NO es válido: {e}")
+            lineas.append("  Seguramente se pegó incompleto o con algún carácter cambiado en Render.")
+
+    # 2. Intentar la conexión y capturar el error concreto
+    lineas.append("")
+    lineas.append("Intentando conectar y leer la hoja...")
+    if gspread is None:
+        lineas.append("  ⚠️ gspread no está instalado.")
+        return "\n".join(lineas), 200
+    if not (SHEET_ID and GOOGLE_CREDENTIALS_JSON):
+        lineas.append("  No se puede intentar: faltan variables.")
+        return "\n".join(lineas), 200
+    try:
+        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(SHEET_ID)
+        lineas.append(f"  ✅ Hoja abierta correctamente: '{sh.title}'")
+        ws = sh.worksheet(SHEET_TAB)
+        lineas.append(f"  ✅ Pestaña '{SHEET_TAB}' encontrada. Filas actuales: {ws.row_count}")
+        lineas.append("  TODO CORRECTO: la conexión funciona.")
+    except Exception as e:
+        msg = str(e)[:300]
+        lineas.append(f"  ⚠️ Error al conectar: {msg}")
+        if "PERMISSION_DENIED" in msg or "403" in msg or "does not have permission" in msg:
+            lineas.append("  CAUSA PROBABLE: la hoja no está compartida con el client_email de arriba (como Editor).")
+        elif "not found" in msg.lower() or "404" in msg:
+            lineas.append("  CAUSA PROBABLE: el SHEET_ID no corresponde a ninguna hoja (revísalo).")
+        elif "csp.withgoogle" in msg or "DOCTYPE" in msg:
+            lineas.append("  CAUSA PROBABLE: SHEET_ID mal formado o credenciales inválidas (Google devuelve página de bloqueo).")
+    return "\n".join(lineas), 200
+
+
 @app.route("/")
 def home():
     # Página simple para comprobar que el servicio está vivo
