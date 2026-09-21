@@ -364,7 +364,7 @@ def guardar_aviso(res: dict, signal_key: str):
             res["entry"], res["tp"], res["sl"],
             "Pendiente", "",
         ]
-        ws.append_row(fila, value_input_option="USER_ENTERED")
+        ws.append_row(fila, value_input_option="RAW")
         log(f"Aviso guardado en Google Sheets (ID {signal_key}).")
     except Exception as e:
         log(f"[ERROR] No se pudo guardar el aviso en Google Sheets: {e}")
@@ -402,7 +402,9 @@ def actualizar_pendientes():
             if len(fila) < 8 or fila[7] != "Pendiente":
                 continue
             fecha_aviso = datetime.strptime(fila[0], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            entry = float(fila[4]); tp = float(fila[5]); sl = float(fila[6])
+            entry = float(str(fila[4]).replace(",", "."))
+            tp = float(str(fila[5]).replace(",", "."))
+            sl = float(str(fila[6]).replace(",", "."))
 
             ventana = precios[precios.index >= fecha_aviso]
             if ventana.empty:
