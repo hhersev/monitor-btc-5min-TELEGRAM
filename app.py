@@ -438,6 +438,77 @@ def actualizar_pendientes():
 # --------------------------------------------------------------------------
 # RUTAS WEB
 # --------------------------------------------------------------------------
+@app.route("/diagpend")
+def diagpend():
+    """Diagnóstico del seguimiento TP/SL: muestra, fila por fila, qué lee de la
+    hoja y por qué no se resuelve. No modifica nada."""
+    out = []
+    ws = get_sheet()
+    if ws is None:
+        return "No se pudo abrir la hoja.", 200
+    try:
+        registros = ws.get_all_values()
+    except Exception as e:
+        return f"Error leyendo filas: {e}", 200
+
+    out.append(f"Total de filas (con cabecera): {len(registros)}")
+    if len(registros) >= 2:
+        out.append(f"Cabecera leída: {registros[0]}")
+        out.append(f"Ejemplo primera fila de datos: {registros[1]}")
+
+    # Descargar precios como hace la función real, y reportar el rango cubierto
+    try:
+        precios = yf.download(TICKER, interval="5m", period=PERIOD, progress=False)
+        if isinstance(precios.columns, pd.MultiIndex):
+            precios.columns = precios.columns.get_level_values(0)
+        precios = precios.rename(columns={"High": "high", "Low": "low"})
+        if precios.index.tz is None:
+            precios.index = precios.index.tz_localize("UTC")
+        out.append("")
+        out.append(f"Histórico de precios descargado: {len(precios)} velas de 5m")
+        out.append(f"  desde {precios.index.min()} hasta {precios.index.max()}")
+    except Exception as e:
+        out.append(f"ERROR descargando precios: {e}")
+        return "\n".join(out), 200
+
+    out.append("")
+    out.append("--- Análisis fila por fila de las PENDIENTES ---")
+    pendientes = 0
+    for i, fila in enumerate(registros[1:], start=2):
+        if len(fila) < 8 or fila[7] != "Pendiente":
+            continue
+        pendientes += 1
+        if pendientes > 20:
+            out.append("... (más de 20, se corta el detalle)")
+            break
+        detalle = [f"Fila {i}:"]
+        detalle.append(f"  columna Fecha (fila[0]) = '{fila[0]}'")
+        # Probar el parseo de fecha con el formato actual
+        try:
+            fa = datetime.strptime(fila[0], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            detalle.append(f"  fecha parseada OK: {fa}")
+            ventana = precios[precios.index >= fa]
+            detalle.append(f"  velas de precio desde esa fecha: {len(ventana)}")
+            if ventana.empty:
+                detalle.append("  ⚠️ VENTANA VACÍA: el histórico descargado no llega tan atrás. "
+                               "Esta es la causa de que no se resuelva.")
+        except Exception as e:
+            detalle.append(f"  ⚠️ FALLO al parsear la fecha: {e}")
+            detalle.append("  Esta es la causa: el formato de la fecha en la hoja no coincide "
+                           "con '%Y-%m-%d %H:%M'.")
+        # Probar los números
+        try:
+            entry = float(fila[4]); tp = float(fila[5]); sl = float(fila[6])
+            detalle.append(f"  entrada={entry} tp={tp} sl={sl} (números OK)")
+        except Exception as e:
+            detalle.append(f"  ⚠️ FALLO al leer los números (entrada/tp/sl): {e}")
+        out.append("\n".join(detalle))
+
+    if pendientes == 0:
+        out.append("No hay filas marcadas como 'Pendiente'.")
+    return "\n".join(out), 200
+
+
 @app.route("/diag")
 def diag():
     """Diagnóstico de la conexión con Google Sheets. Devuelve en texto claro
