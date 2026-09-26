@@ -70,7 +70,8 @@ PERIOD = "60d"
 WINDOW = 8
 RANGE_THRESHOLD = 0.006
 ENTRY_BUFFER = 0.001718
-RR = 1.0
+RR = 1.0            # ratio principal (el que opera de siempre)
+RR2 = 1.2           # segundo ratio, en seguimiento paralelo para comparar
 STALE_THRESHOLD = 0.0015
 
 FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
@@ -242,7 +243,8 @@ def detect_signal(df: pd.DataFrame) -> dict:
     entry = round(zone_high * (1 + ENTRY_BUFFER), 2)
     sl = round(float(zone_low), 2)
     risk = entry - sl
-    tp = round(entry + RR * risk, 2)
+    tp = round(entry + RR * risk, 2)      # TP del ratio principal (1:1)
+    tp2 = round(entry + RR2 * risk, 2)    # TP del segundo ratio (1,2:1) en seguimiento
 
     current_price = float(close[i])
     if current_price > entry * (1 + STALE_THRESHOLD):
@@ -252,7 +254,7 @@ def detect_signal(df: pd.DataFrame) -> dict:
                     distancia_pct=round(distancia_pct, 2))
 
     return dict(status="señal", zone_high=round(float(zone_high), 2), zone_low=sl,
-                price=round(current_price, 2), entry=entry, tp=tp, sl=sl,
+                price=round(current_price, 2), entry=entry, tp=tp, tp2=tp2, sl=sl,
                 rsi=round(float(rsi14[i]), 1), funding=funding,
                 provisional=not df.attrs.get("last_candle_closed", True))
 
@@ -262,7 +264,9 @@ def format_message(res: dict, encabezado: str) -> str:
         encabezado,
         f"Zona de acumulación: {res['zone_low']} - {res['zone_high']}",
         f"ENTRADA sugerida: {res['entry']}",
-        f"TAKE PROFIT: {res['tp']}  ({(res['tp']/res['entry']-1)*100:+.2f}%)",
+        f"TAKE PROFIT (1:1): {res['tp']}  ({(res['tp']/res['entry']-1)*100:+.2f}%)",
+        f"TAKE PROFIT (1,2:1): {res.get('tp2', '—')}"
+        + (f"  ({(res['tp2']/res['entry']-1)*100:+.2f}%)" if res.get('tp2') else ""),
         f"STOP LOSS: {res['sl']}  ({(res['sl']/res['entry']-1)*100:+.2f}%)",
         f"RSI(14): {res['rsi']}",
     ]
@@ -363,6 +367,7 @@ def guardar_aviso(res: dict, signal_key: str):
             f"{res['zone_low']}-{res['zone_high']}",
             res["entry"], res["tp"], res["sl"],
             "Pendiente", "",
+            res.get("tp2", ""), "Pendiente",   # col J: TP 1,2:1 | col K: Resultado 1,2:1
         ]
         ws.append_row(fila, value_input_option="RAW")
         log(f"Aviso guardado en Google Sheets (ID {signal_key}).")
@@ -399,39 +404,72 @@ def actualizar_pendientes():
 
     for i, fila in enumerate(registros[1:], start=2):  # start=2: fila real en la hoja
         try:
-            if len(fila) < 8 or fila[7] != "Pendiente":
+            # ¿Queda algo pendiente en esta fila? (col H = ratio 1:1, col K = ratio 1,2:1)
+            res1_actual = fila[7] if len(fila) > 7 else ""
+            res2_actual = fila[10] if len(fila) > 10 else ""
+            pend1 = (res1_actual == "Pendiente")
+            pend2 = (res2_actual == "Pendiente")
+            if not (pend1 or pend2):
                 continue
+
             fecha_aviso = datetime.strptime(fila[0], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
             entry = float(str(fila[4]).replace(",", "."))
             tp = float(str(fila[5]).replace(",", "."))
             sl = float(str(fila[6]).replace(",", "."))
+            # TP del segundo ratio en col J (índice 9); si falta, lo recalculamos
+            try:
+                tp2 = float(str(fila[9]).replace(",", "."))
+            except (IndexError, ValueError):
+                tp2 = round(entry + RR2 * (entry - sl), 2)
 
             ventana = precios[precios.index >= fecha_aviso]
             if ventana.empty:
                 continue
 
-            resultado = None
+            # Recorrer las velas una sola vez, resolviendo cada ratio en cuanto toca su TP o el SL
+            res1 = None; fecha1 = None
+            res2 = None; fecha2 = None
             for ts, row in ventana.iterrows():
                 hi = float(row["high"]); lo = float(row["low"])
-                hit_tp = hi >= tp
-                hit_sl = lo <= sl
-                if hit_tp and hit_sl:
-                    resultado = "SL"; fecha_res = ts; break  # misma vela: conservador -> SL
-                elif hit_tp:
-                    resultado = "TP"; fecha_res = ts; break
-                elif hit_sl:
-                    resultado = "SL"; fecha_res = ts; break
+                # Ratio 1:1
+                if res1 is None:
+                    if hi >= tp and lo <= sl:
+                        res1 = "SL"; fecha1 = ts   # misma vela: conservador -> SL
+                    elif hi >= tp:
+                        res1 = "TP"; fecha1 = ts
+                    elif lo <= sl:
+                        res1 = "SL"; fecha1 = ts
+                # Ratio 1,2:1
+                if res2 is None:
+                    if hi >= tp2 and lo <= sl:
+                        res2 = "SL"; fecha2 = ts
+                    elif hi >= tp2:
+                        res2 = "TP"; fecha2 = ts
+                    elif lo <= sl:
+                        res2 = "SL"; fecha2 = ts
+                if res1 is not None and res2 is not None:
+                    break
 
-            if resultado is None:
-                # ¿Ha pasado ya el horizonte de seguimiento sin resolverse?
-                if datetime.now(timezone.utc) - fecha_aviso > timedelta(days=HORIZON_DIAS):
+            ahora = datetime.now(timezone.utc)
+            caducado = (ahora - fecha_aviso) > timedelta(days=HORIZON_DIAS)
+
+            # Actualizar ratio 1:1 (columnas H=8 resultado, I=9 fecha)
+            if pend1:
+                if res1 is not None:
+                    ws.update_cell(i, 8, res1)
+                    ws.update_cell(i, 9, fecha1.strftime("%Y-%m-%d"))
+                    log(f"Fila {i} ratio 1:1 resuelto: {res1}")
+                elif caducado:
                     ws.update_cell(i, 8, "Sin resolver")
-                    ws.update_cell(i, 9, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-                continue
+                    ws.update_cell(i, 9, ahora.strftime("%Y-%m-%d"))
 
-            ws.update_cell(i, 8, "TP" if resultado == "TP" else "SL")
-            ws.update_cell(i, 9, fecha_res.strftime("%Y-%m-%d"))
-            log(f"Pendiente resuelto (fila {i}): {resultado}")
+            # Actualizar ratio 1,2:1 (columna K=11 resultado)
+            if pend2:
+                if res2 is not None:
+                    ws.update_cell(i, 11, res2)
+                    log(f"Fila {i} ratio 1,2:1 resuelto: {res2}")
+                elif caducado:
+                    ws.update_cell(i, 11, "Sin resolver")
         except Exception as e:
             log(f"[AVISO] No se pudo procesar la fila {i}: {e}")
             continue
