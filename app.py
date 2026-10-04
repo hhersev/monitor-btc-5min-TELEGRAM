@@ -122,7 +122,46 @@ def send_telegram(text: str):
 # --------------------------------------------------------------------------
 # DATOS E INDICADORES (idénticos a la versión validada)
 # --------------------------------------------------------------------------
-def fetch_price_data() -> pd.DataFrame:
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_SYMBOL = "BTCEUR"   # el mismo par de donde salieron los 6,5 años de datos
+
+
+def _descargar_binance_5m(dias=60) -> pd.DataFrame:
+    """Descarga velas de 5m de BTCEUR desde la API pública de Binance.
+    Pagina en bloques de 1000 velas hasta cubrir ~`dias` días."""
+    limite_por_llamada = 1000
+    ahora_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    inicio_ms = ahora_ms - dias * 24 * 60 * 60 * 1000
+    filas = []
+    cursor = inicio_ms
+    while cursor < ahora_ms:
+        params = {"symbol": BINANCE_SYMBOL, "interval": "5m",
+                  "startTime": cursor, "limit": limite_por_llamada}
+        resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        lote = resp.json()
+        if not lote:
+            break
+        filas.extend(lote)
+        ultimo = lote[-1][0]
+        if ultimo <= cursor:
+            break
+        cursor = ultimo + 1
+        if len(lote) < limite_por_llamada:
+            break
+    if not filas:
+        raise ValueError("Binance devolvió vacío")
+    df = pd.DataFrame(filas, columns=["open_time", "open", "high", "low", "close", "volume",
+                                       "close_time", "qv", "trades", "tb", "tq", "ig"])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.set_index("open_time")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    return df[["open", "high", "low", "close", "volume"]].dropna()
+
+
+def _descargar_yfinance_5m() -> pd.DataFrame:
+    """Respaldo: velas de 5m desde yfinance (Yahoo)."""
     df5 = yf.download(TICKER, interval=FETCH_INTERVAL, period=PERIOD, progress=False)
     if isinstance(df5.columns, pd.MultiIndex):
         df5.columns = df5.columns.get_level_values(0)
@@ -131,6 +170,27 @@ def fetch_price_data() -> pd.DataFrame:
     if df5.index.tz is None:
         df5.index = df5.index.tz_localize("UTC")
     df5 = df5[["open", "high", "low", "close", "volume"]].dropna()
+    if df5.empty:
+        raise ValueError("yfinance devolvió vacío")
+    return df5
+
+
+def descargar_5m() -> pd.DataFrame:
+    """Doble fuente: intenta Binance primero; si falla, usa yfinance. Si fallan
+    las dos, lanza la excepción para que el llamador la gestione."""
+    try:
+        df = _descargar_binance_5m()
+        log(f"Datos de precio: Binance OK ({len(df)} velas de 5m).")
+        return df
+    except Exception as e:
+        log(f"[AVISO] Binance falló ({e}). Probando yfinance...")
+    df = _descargar_yfinance_5m()
+    log(f"Datos de precio: yfinance OK ({len(df)} velas de 5m).")
+    return df
+
+
+def fetch_price_data() -> pd.DataFrame:
+    df5 = descargar_5m()
 
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     df15 = df5.resample("15min", label="left", closed="left").agg(agg).dropna()
@@ -390,14 +450,9 @@ def actualizar_pendientes():
     if len(registros) < 2:
         return  # solo cabecera
 
-    # Descargar histórico de precios 5m una sola vez (cubre ~60 días)
+    # Descargar histórico de precios 5m una sola vez (doble fuente Binance/yfinance)
     try:
-        precios = yf.download(TICKER, interval="5m", period=PERIOD, progress=False)
-        if isinstance(precios.columns, pd.MultiIndex):
-            precios.columns = precios.columns.get_level_values(0)
-        precios = precios.rename(columns={"High": "high", "Low": "low"})
-        if precios.index.tz is None:
-            precios.index = precios.index.tz_localize("UTC")
+        precios = descargar_5m()
     except Exception as e:
         log(f"[ERROR] No se pudo descargar histórico para seguir pendientes: {e}")
         return
@@ -498,12 +553,7 @@ def diagpend():
 
     # Descargar precios como hace la función real, y reportar el rango cubierto
     try:
-        precios = yf.download(TICKER, interval="5m", period=PERIOD, progress=False)
-        if isinstance(precios.columns, pd.MultiIndex):
-            precios.columns = precios.columns.get_level_values(0)
-        precios = precios.rename(columns={"High": "high", "Low": "low"})
-        if precios.index.tz is None:
-            precios.index = precios.index.tz_localize("UTC")
+        precios = descargar_5m()
         out.append("")
         out.append(f"Histórico de precios descargado: {len(precios)} velas de 5m")
         out.append(f"  desde {precios.index.min()} hasta {precios.index.max()}")
