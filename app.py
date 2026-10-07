@@ -72,6 +72,15 @@ RANGE_THRESHOLD = 0.006
 ENTRY_BUFFER = 0.001718
 RR = 1.0            # ratio principal (el que opera de siempre)
 RR2 = 1.2           # segundo ratio, en seguimiento paralelo para comparar
+# Salida parcial (validada como la mejor configuración, robusta en ambos periodos y
+# con comisiones reales). Se operan DOS posiciones iguales e independientes:
+#   - Posición A: TP = 1R (ratio 1:1),  SL = suelo de la zona
+#   - Posición B: TP = 2.5R (ratio 2,5:1), SL = suelo de la zona
+# Cuando A cierra en su TP, se mueve manualmente el SL de B al precio de entrada
+# (break-even a 0%, que en backtest batió al +0,2%). 2,5R batió a 2R y a 3R.
+RR_PARCIAL_1 = 1.0  # Posición A: objetivo 1R
+RR_PARCIAL_2 = 2.5  # Posición B: objetivo 2,5R
+RR3 = 2.5           # tercer ratio en seguimiento en Google Sheets = objetivo de la Posición B
 STALE_THRESHOLD = 0.0015
 
 FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
@@ -305,6 +314,8 @@ def detect_signal(df: pd.DataFrame) -> dict:
     risk = entry - sl
     tp = round(entry + RR * risk, 2)      # TP del ratio principal (1:1)
     tp2 = round(entry + RR2 * risk, 2)    # TP del segundo ratio (1,2:1) en seguimiento
+    tp_parcial_1 = round(entry + RR_PARCIAL_1 * risk, 2)  # Posición A: TP a 1R
+    tp_parcial_2 = round(entry + RR_PARCIAL_2 * risk, 2)  # Posición B: TP a 2,5R
 
     current_price = float(close[i])
     if current_price > entry * (1 + STALE_THRESHOLD):
@@ -315,26 +326,44 @@ def detect_signal(df: pd.DataFrame) -> dict:
 
     return dict(status="señal", zone_high=round(float(zone_high), 2), zone_low=sl,
                 price=round(current_price, 2), entry=entry, tp=tp, tp2=tp2, sl=sl,
+                tp_parcial_1=tp_parcial_1, tp_parcial_2=tp_parcial_2,
                 rsi=round(float(rsi14[i]), 1), funding=funding,
                 provisional=not df.attrs.get("last_candle_closed", True))
 
 
 def format_message(res: dict, encabezado: str) -> str:
+    entry = res['entry']
+    sl = res['sl']
+    tp_a = res.get('tp_parcial_1', res['tp'])   # Posición A: TP a 1R
+    tp_b = res.get('tp_parcial_2')              # Posición B: TP a 2,5R
+    pct = lambda x: (x / entry - 1) * 100
     lines = [
         encabezado,
         f"Zona de acumulación: {res['zone_low']} - {res['zone_high']}",
-        f"ENTRADA sugerida: {res['entry']}",
-        f"TAKE PROFIT (1:1): {res['tp']}  ({(res['tp']/res['entry']-1)*100:+.2f}%)",
-        f"TAKE PROFIT (1,2:1): {res.get('tp2', '—')}"
-        + (f"  ({(res['tp2']/res['entry']-1)*100:+.2f}%)" if res.get('tp2') else ""),
-        f"STOP LOSS: {res['sl']}  ({(res['sl']/res['entry']-1)*100:+.2f}%)",
+        f"ENTRADA sugerida: {entry}",
+        "",
+        "Abre DOS posiciones iguales (mitad de capital cada una):",
+        "",
+        "── Posición A ──",
+        f"TP: {tp_a}  ({pct(tp_a):+.2f}%, ratio 1:1)",
+        f"SL: {sl}  ({pct(sl):+.2f}%)",
+        "",
+        "── Posición B ──",
+    ]
+    if tp_b:
+        lines.append(f"TP: {tp_b}  ({pct(tp_b):+.2f}%, ratio 2.5:1)")
+    lines += [
+        f"SL: {sl}  ({pct(sl):+.2f}%)",
+        "",
+        "⚠️ Si se cierra A en su TP → edita el SL de B",
+        f"   y súbelo a {entry} (precio de entrada)",
+        "",
         f"RSI(14): {res['rsi']}",
     ]
     if res.get("funding"):
         lines.append(f"Funding rate: percentil {res['funding']['percentile']*100:.0f}% ({res['funding']['source']})")
     lines.append("")
     lines.append("Aviso, no orden automática. Revisa antes de operar.")
-    lines.append("Resultados validados en bruto (sin comisiones).")
     return "\n".join(lines)
 
 
@@ -435,6 +464,35 @@ def guardar_aviso(res: dict, signal_key: str):
         log(f"[ERROR] No se pudo guardar el aviso en Google Sheets: {e}")
 
 
+def resolver_posicion_b(ventana, entry, sl, tp_1r, tp3):
+    """Resuelve la Posición B (TP a 2,5R) con su stop DINÁMICO de break-even:
+    el stop está en el suelo (sl) hasta que el precio toca 1R (= TP de la Posición A);
+    a partir de ahí el stop sube a la entrada (break-even a 0%).
+    Devuelve (resultado, fecha) con resultado en {'TP','BE','SL'} o (None, None)
+    si todavía no se ha resuelto. Criterio conservador en velas que tocan dos
+    niveles a la vez (se asume el desenlace peor)."""
+    reached_1r = False
+    for ts, row in ventana.iterrows():
+        hi = float(row["high"]); lo = float(row["low"])
+        if not reached_1r:
+            # Stop todavía en el suelo de la zona
+            if lo <= sl:
+                return "SL", ts            # (si además tocara 1R la misma vela, conservador: SL)
+            if hi >= tp3:
+                return "TP", ts            # llegó a 2,5R de una vez (implica haber pasado 1R)
+            if hi >= tp_1r:
+                reached_1r = True
+                if lo <= entry:            # la misma vela que alcanza 1R ya recae a la entrada
+                    return "BE", ts
+        else:
+            # Stop ya en break-even (precio de entrada)
+            if lo <= entry:
+                return "BE", ts            # (si además tocara 2,5R la misma vela, conservador: BE)
+            if hi >= tp3:
+                return "TP", ts
+    return None, None
+
+
 def actualizar_pendientes():
     """Revisa las filas 'Pendiente' y comprueba, con el histórico de precios,
     si desde la fecha del aviso el precio tocó antes el TP o el SL."""
@@ -459,12 +517,16 @@ def actualizar_pendientes():
 
     for i, fila in enumerate(registros[1:], start=2):  # start=2: fila real en la hoja
         try:
-            # ¿Queda algo pendiente en esta fila? (col H = ratio 1:1, col K = ratio 1,2:1)
+            # ¿Queda algo pendiente en esta fila?
+            # col H = ratio 1:1 | col K = ratio 1,2:1 | col S = ratio 2,5:1 (Posición B)
             res1_actual = fila[7] if len(fila) > 7 else ""
             res2_actual = fila[10] if len(fila) > 10 else ""
+            res3_actual = fila[18] if len(fila) > 18 else ""
             pend1 = (res1_actual == "Pendiente")
             pend2 = (res2_actual == "Pendiente")
-            if not (pend1 or pend2):
+            # S vacío = fila antigua anterior al 2,5:1 -> se rellena hacia atrás
+            pend3 = (res3_actual in ("", "Pendiente"))
+            if not (pend1 or pend2 or pend3):
                 continue
 
             fecha_aviso = datetime.strptime(fila[0], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
@@ -476,6 +538,11 @@ def actualizar_pendientes():
                 tp2 = float(str(fila[9]).replace(",", "."))
             except (IndexError, ValueError):
                 tp2 = round(entry + RR2 * (entry - sl), 2)
+            # TP del tercer ratio (2,5:1) en col R (índice 17); si falta, lo recalculamos
+            try:
+                tp3 = float(str(fila[17]).replace(",", "."))
+            except (IndexError, ValueError):
+                tp3 = round(entry + RR3 * (entry - sl), 2)
 
             ventana = precios[precios.index >= fecha_aviso]
             if ventana.empty:
@@ -505,6 +572,11 @@ def actualizar_pendientes():
                 if res1 is not None and res2 is not None:
                     break
 
+            # Ratio 2,5:1 (Posición B, con stop dinámico de break-even): pase aparte
+            res3 = None; fecha3 = None
+            if pend3:
+                res3, fecha3 = resolver_posicion_b(ventana, entry, sl, tp, tp3)
+
             ahora = datetime.now(timezone.utc)
             caducado = (ahora - fecha_aviso) > timedelta(days=HORIZON_DIAS)
 
@@ -525,6 +597,19 @@ def actualizar_pendientes():
                     log(f"Fila {i} ratio 1,2:1 resuelto: {res2}")
                 elif caducado:
                     ws.update_cell(i, 11, "Sin resolver")
+
+            # Actualizar ratio 2,5:1 / Posición B (col R=18 precio TP | col S=19 resultado)
+            if pend3:
+                # rellenar el precio del TP 2,5:1 en R si estaba vacío (filas antiguas)
+                if str(res3_actual).strip() == "" and (len(fila) <= 17 or str(fila[17]).strip() == ""):
+                    ws.update_cell(i, 18, tp3)
+                if res3 is not None:
+                    ws.update_cell(i, 19, res3)
+                    log(f"Fila {i} ratio 2,5:1 (Posición B) resuelto: {res3}")
+                elif caducado:
+                    ws.update_cell(i, 19, "Sin resolver")
+                elif res3_actual == "":
+                    ws.update_cell(i, 19, "Pendiente")
         except Exception as e:
             log(f"[AVISO] No se pudo procesar la fila {i}: {e}")
             continue
