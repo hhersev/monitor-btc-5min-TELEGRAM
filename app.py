@@ -523,7 +523,8 @@ def actualizar_pendientes():
             res2_actual = fila[10] if len(fila) > 10 else ""
             res3_actual = fila[18] if len(fila) > 18 else ""
             pend1 = (res1_actual == "Pendiente")
-            pend2 = (res2_actual == "Pendiente")
+            # K vacío = fila antigua anterior al 1,2:1 -> se rellena hacia atrás (igual que el 2,5:1)
+            pend2 = (res2_actual in ("", "Pendiente"))
             # S vacío = fila antigua anterior al 2,5:1 -> se rellena hacia atrás
             pend3 = (res3_actual in ("", "Pendiente"))
             if not (pend1 or pend2 or pend3):
@@ -590,13 +591,18 @@ def actualizar_pendientes():
                     ws.update_cell(i, 8, "Sin resolver")
                     ws.update_cell(i, 9, ahora.strftime("%Y-%m-%d"))
 
-            # Actualizar ratio 1,2:1 (columna K=11 resultado)
+            # Actualizar ratio 1,2:1 (col J=10 precio TP | col K=11 resultado)
             if pend2:
+                # rellenar el precio del TP 1,2:1 en J si estaba vacío (filas antiguas anteriores al 1,2:1)
+                if str(res2_actual).strip() == "" and (len(fila) <= 9 or str(fila[9]).strip() == ""):
+                    ws.update_cell(i, 10, tp2)
                 if res2 is not None:
                     ws.update_cell(i, 11, res2)
                     log(f"Fila {i} ratio 1,2:1 resuelto: {res2}")
                 elif caducado:
                     ws.update_cell(i, 11, "Sin resolver")
+                elif res2_actual == "":
+                    ws.update_cell(i, 11, "Pendiente")
 
             # Actualizar ratio 2,5:1 / Posición B (col R=18 precio TP | col S=19 resultado)
             if pend3:
