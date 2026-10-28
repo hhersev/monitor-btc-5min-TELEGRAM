@@ -789,6 +789,333 @@ def test():
     return "Mensaje de prueba enviado a Telegram. Revisa tu móvil.", 200
 
 
+# ==========================================================================
+# =================  MONITOR DE TENDENCIA (BLOQUE AÑADIDO)  =================
+# ==========================================================================
+# Independiente del monitor intradía de arriba: NO modifica ninguna de sus
+# funciones, rutas ni variables. Estrategia: cierre diario de BTC/EUR frente a
+# su media de 100 días (SMA100), con banda ±2% e histéresis.
+#   - COMPRA: estando FUERA, el cierre supera SMA100 × 1,02.
+#   - VENTA:  estando DENTRO, el cierre cae por debajo de SMA100 × 0,98.
+# Una sola comprobación al día (la señal no cambia tras el cierre de 00:00 UTC).
+# Bot de Telegram DEDICADO (variables TELEGRAM_TOKEN_TREND / _CHAT_ID_TREND).
+# Tres pestañas propias en el mismo Google Sheets (no toca Avisos/Resumen).
+# --------------------------------------------------------------------------
+TREND_TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN_TREND")
+TREND_TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID_TREND")
+
+TREND_SMA = 100
+TREND_BAND = 0.02
+TREND_COST = 0.001            # comisión taker usada en los cálculos (0,1%)
+
+TREND_TAB = "Tendencia"
+TREND_STATE_TAB = "Estado_Tendencia"
+TREND_SUMMARY_TAB = "Tendencia_Resumen"
+
+# Entrada manual inicial con la que se siembra el monitor (arrancas DENTRO):
+TREND_SEED_FECHA = "2026-10-06"
+TREND_SEED_PRECIO = 75990.0
+TREND_SEED_BTC = 0.01315962
+TREND_SEED_CAPITAL = 1000.0
+
+TREND_HEADERS = ["Fecha", "Señal", "Cierre €", "SMA100 €", "Distancia",
+                 "BTC", "Comisión €", "Capital tras op €", "Resultado",
+                 "Estado", "Nº"]
+
+# Orden fijo de los campos en la pestaña Estado_Tendencia (no reordenar a mano):
+TREND_STATE_ORDER = ["estado", "fecha_entrada", "precio_entrada",
+                     "btc_en_cartera", "capital_efectivo", "num_operaciones",
+                     "ultima_comprobacion"]
+
+
+def _esnum(x, dec=0, sign=False):
+    """Formatea un número al estilo español (miles con '.', decimales con ',').
+    SOLO para mostrar: nunca se usa en valores que luego se vuelven a leer."""
+    fmt = f"{{:+,.{dec}f}}" if sign else f"{{:,.{dec}f}}"
+    return fmt.format(x).replace(",", "@").replace(".", ",").replace("@", ".")
+
+
+def trend_send_telegram(text: str):
+    if not (TREND_TELEGRAM_TOKEN and TREND_TELEGRAM_CHAT_ID):
+        log("[TENDENCIA][AVISO] Faltan TELEGRAM_TOKEN_TREND o TELEGRAM_CHAT_ID_TREND. No se envía.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TREND_TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={"chat_id": TREND_TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+        resp.raise_for_status()
+        log("[TENDENCIA] Aviso de Telegram enviado.")
+    except Exception as e:
+        log(f"[TENDENCIA][ERROR] No se pudo enviar el aviso: {e}")
+
+
+def trend_fetch_daily(dias: int = 220):
+    """(cierre, sma100, fecha) de la ÚLTIMA vela diaria CERRADA de BTC/EUR.
+    Fuente: Binance (misma que el intradía); respaldo: yfinance."""
+    serie = None
+    try:
+        params = {"symbol": BINANCE_SYMBOL, "interval": "1d", "limit": dias}
+        resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close",
+                                         "volume", "close_time", "qv", "tr", "tb", "tq", "ig"])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close"] = df["close"].astype(float)
+        serie = df.set_index("open_time")["close"]
+        log(f"[TENDENCIA] Datos diarios: Binance OK ({len(serie)} velas).")
+    except Exception as e:
+        log(f"[TENDENCIA][AVISO] Binance diario falló ({e}). Probando yfinance...")
+        d = yf.download(TICKER, interval="1d", period=f"{dias + 40}d", progress=False)
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        d = d.rename(columns={"Close": "close"})
+        if d.index.tz is None:
+            d.index = d.index.tz_localize("UTC")
+        serie = d["close"].astype(float)
+        log(f"[TENDENCIA] Datos diarios: yfinance OK ({len(serie)} velas).")
+    # Excluir la vela del día EN CURSO (open_time == hoy 00:00 UTC): aún no ha cerrado.
+    hoy = pd.Timestamp.now(tz="UTC").normalize()
+    serie = serie[serie.index < hoy].dropna()
+    if len(serie) < TREND_SMA + 1:
+        raise ValueError(f"insuficientes velas diarias ({len(serie)}) para SMA{TREND_SMA}")
+    sma = serie.rolling(TREND_SMA).mean()
+    return float(serie.iloc[-1]), float(sma.iloc[-1]), serie.index[-1].strftime("%Y-%m-%d")
+
+
+def trend_spreadsheet():
+    if gspread is None or not (SHEET_ID and GOOGLE_CREDENTIALS_JSON):
+        return None
+    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds).open_by_key(SHEET_ID)
+
+
+def trend_ws(sh, title, headers=None, rows=400, cols=12):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        if headers:
+            ws.append_row(headers, value_input_option="RAW")
+        return ws
+
+
+def trend_read_state(sh):
+    ws = sh.worksheet(TREND_STATE_TAB)
+    estado = {}
+    for row in ws.get_all_values():
+        if len(row) >= 2 and row[0].strip():
+            estado[row[0].strip()] = row[1].strip()
+    return estado, ws
+
+
+def trend_set_state(ws, campo, valor):
+    fila = TREND_STATE_ORDER.index(campo) + 1
+    ws.update_cell(fila, 2, str(valor))
+
+
+def trend_update_summary(sh, estado, precio_actual):
+    try:
+        ws = trend_ws(sh, TREND_SUMMARY_TAB, rows=30, cols=2)
+        dentro = estado.get("estado") == "DENTRO"
+        btc = float(estado.get("btc_en_cartera") or 0)
+        efectivo = float(estado.get("capital_efectivo") or 0)
+        if dentro:
+            valor = btc * precio_actual
+            pl = (precio_actual / float(estado.get("precio_entrada") or precio_actual) - 1) * 100
+            valor_txt, pl_txt = f"{_esnum(valor, 2)} €", f"{_esnum(pl, 1, True)} %"
+        else:
+            valor_txt, pl_txt = f"{_esnum(efectivo, 2)} €", "— (en efectivo)"
+        filas = [
+            ["Capital inicial", f"{_esnum(TREND_SEED_CAPITAL, 2)} €"],
+            ["Fecha inicio", TREND_SEED_FECHA],
+            ["Entrada", f"{_esnum(TREND_SEED_PRECIO)} € · {_esnum(TREND_SEED_BTC, 8)} BTC"],
+            ["Estado actual", estado.get("estado", "")],
+            ["Valor actual", valor_txt],
+            ["P/L no realizado", pl_txt],
+            ["Operaciones (nº)", estado.get("num_operaciones", "")],
+            ["Última actualización", estado.get("ultima_comprobacion", "")],
+        ]
+        ws.clear()
+        for f in filas:
+            ws.append_row(f, value_input_option="RAW")
+    except Exception as e:
+        log(f"[TENDENCIA][AVISO] No se pudo actualizar el resumen: {e}")
+
+
+def trend_seed_sheets():
+    """Crea (si faltan) las tres pestañas y siembra el estado inicial DENTRO con
+    la entrada manual. Idempotente: si ya hay estado, no toca nada."""
+    sh = trend_spreadsheet()
+    if sh is None:
+        return "Google Sheets no configurado (faltan SHEET_ID o credenciales)."
+    try:
+        est, _ = trend_read_state(sh)
+        if est.get("estado"):
+            return f"Ya estaba sembrado (estado={est.get('estado')}). No se toca nada."
+    except Exception:
+        pass
+    wl = trend_ws(sh, TREND_TAB, headers=TREND_HEADERS)
+    wl.append_row([TREND_SEED_FECHA, "COMPRA (MANUAL)", TREND_SEED_PRECIO, "", "",
+                   TREND_SEED_BTC, "", round(TREND_SEED_CAPITAL, 2), "", "DENTRO", 1],
+                  value_input_option="RAW")
+    we = trend_ws(sh, TREND_STATE_TAB, rows=20, cols=2)
+    we.clear()
+    seed = {"estado": "DENTRO", "fecha_entrada": TREND_SEED_FECHA,
+            "precio_entrada": TREND_SEED_PRECIO, "btc_en_cartera": TREND_SEED_BTC,
+            "capital_efectivo": 0, "num_operaciones": 1,
+            "ultima_comprobacion": "(sin ejecutar aún)"}
+    for k in TREND_STATE_ORDER:
+        we.append_row([k, str(seed[k])], value_input_option="RAW")
+    trend_update_summary(sh, seed, TREND_SEED_PRECIO)
+    log("[TENDENCIA] Hojas creadas y sembradas (DENTRO).")
+    return ("Sembrado OK: pestañas Tendencia, Estado_Tendencia y Tendencia_Resumen "
+            "creadas. Arrancas DENTRO con tu compra manual.")
+
+
+def trend_msg_venta(cierre, sma, dist, estado, neto, r):
+    return (
+        "\U0001F534 SEÑAL DE VENTA  ·  Monitor Tendencia\n\n"
+        "Cambio de estado: DENTRO → FUERA\n"
+        "El cierre diario ha caído un 2% por debajo de la media de 100 días.\n\n"
+        f"Cierre:     {_esnum(cierre)} €\n"
+        f"SMA100:     {_esnum(sma)} €\n"
+        f"Distancia:  {_esnum(dist, 2, True)}%   (umbral de venta: -2,00%)\n\n"
+        "➡️ Acción: VENDE TODO el BTC/EUR a mercado.\n"
+        "   Tipo de orden: MERCADO (taker ~0,1%).\n\n"
+        f"\U0001F4C4 Compraste el {estado.get('fecha_entrada')} a "
+        f"{_esnum(float(estado.get('precio_entrada')))} € "
+        f"({_esnum(float(estado.get('btc_en_cartera')), 8)} BTC).\n"
+        f"   Resultado de esta operación: {_esnum(r, 1, True)}%.\n\n"
+        f"\U0001F4B6 Quedas en EFECTIVO: {_esnum(neto, 2)} €.\n"
+        "   Esperando la próxima señal de compra.\n\n"
+        "Aviso, no orden automática. Revisa antes de operar."
+    )
+
+
+def trend_msg_compra(cierre, sma, dist, efectivo, btc, nop):
+    return (
+        "\U0001F535 SEÑAL DE COMPRA  ·  Monitor Tendencia\n\n"
+        "Cambio de estado: FUERA → DENTRO\n"
+        "El cierre diario ha superado la media de 100 días en +2%.\n\n"
+        f"Cierre:     {_esnum(cierre)} €\n"
+        f"SMA100:     {_esnum(sma)} €\n"
+        f"Distancia:  {_esnum(dist, 2, True)}%   (umbral de compra: +2,00%)\n\n"
+        "➡️ Acción: COMPRA BTC/EUR a mercado con TODO el capital.\n"
+        "   Tipo de orden: MERCADO (taker ~0,1%).\n\n"
+        f"\U0001F4B6 Capital disponible: {_esnum(efectivo, 2)} €  →  ~{_esnum(btc, 8)} BTC.\n\n"
+        "❌ NO pongas stop-loss. La salida será otra señal de este monitor.\n\n"
+        f"Operación de compra nº {nop} del histórico.\n\n"
+        "Aviso, no orden automática. Revisa antes de operar."
+    )
+
+
+def do_trend_check():
+    sh = trend_spreadsheet()
+    if sh is None:
+        return "Google Sheets no configurado."
+    try:
+        estado, ws_estado = trend_read_state(sh)
+    except Exception:
+        return "Sin sembrar. Llama primero a /trend_seed."
+    if not estado.get("estado"):
+        return "Sin sembrar. Llama primero a /trend_seed."
+
+    cierre, sma, fecha = trend_fetch_daily()
+    dist = (cierre / sma - 1) * 100
+    ahora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    wl = trend_ws(sh, TREND_TAB, headers=TREND_HEADERS)
+
+    if estado["estado"] == "DENTRO":
+        if cierre < sma * (1 - TREND_BAND):
+            precio_ent = float(estado.get("precio_entrada"))
+            btc = float(estado.get("btc_en_cartera"))
+            bruto = btc * cierre
+            fee = bruto * TREND_COST
+            neto = bruto - fee
+            r = (cierre / precio_ent - 1) * 100
+            nop = int(float(estado.get("num_operaciones", 0))) + 1
+            wl.append_row([fecha, "VENTA", round(cierre), round(sma), _esnum(dist, 2, True) + "%",
+                           round(btc, 8), round(fee, 2), round(neto, 2), _esnum(r, 1, True) + "%",
+                           "FUERA", nop], value_input_option="RAW")
+            trend_set_state(ws_estado, "estado", "FUERA")
+            trend_set_state(ws_estado, "fecha_entrada", "")
+            trend_set_state(ws_estado, "precio_entrada", "")
+            trend_set_state(ws_estado, "btc_en_cartera", 0)
+            trend_set_state(ws_estado, "capital_efectivo", round(neto, 2))
+            trend_set_state(ws_estado, "num_operaciones", nop)
+            trend_set_state(ws_estado, "ultima_comprobacion", ahora)
+            trend_send_telegram(trend_msg_venta(cierre, sma, dist, estado, neto, r))
+            trend_update_summary(sh, dict(estado, estado="FUERA", capital_efectivo=round(neto, 2),
+                                          btc_en_cartera=0, num_operaciones=nop,
+                                          ultima_comprobacion=ahora), cierre)
+            return f"VENTA enviada a {cierre:.0f} ({r:+.1f}%)."
+        trend_set_state(ws_estado, "ultima_comprobacion", ahora)
+        trend_update_summary(sh, dict(estado, ultima_comprobacion=ahora), cierre)
+        return f"sin cambio (DENTRO, cierre {cierre:.0f}, dist {dist:+.2f}%)"
+
+    # estado == FUERA
+    if cierre > sma * (1 + TREND_BAND):
+        efectivo = float(estado.get("capital_efectivo") or 0)
+        fee = efectivo * TREND_COST
+        btc = (efectivo - fee) / cierre
+        nop = int(float(estado.get("num_operaciones", 0))) + 1
+        wl.append_row([fecha, "COMPRA", round(cierre), round(sma), _esnum(dist, 2, True) + "%",
+                       round(btc, 8), round(fee, 2), round(efectivo, 2), "",
+                       "DENTRO", nop], value_input_option="RAW")
+        trend_set_state(ws_estado, "estado", "DENTRO")
+        trend_set_state(ws_estado, "fecha_entrada", fecha)
+        trend_set_state(ws_estado, "precio_entrada", round(cierre, 2))
+        trend_set_state(ws_estado, "btc_en_cartera", round(btc, 8))
+        trend_set_state(ws_estado, "capital_efectivo", 0)
+        trend_set_state(ws_estado, "num_operaciones", nop)
+        trend_set_state(ws_estado, "ultima_comprobacion", ahora)
+        trend_send_telegram(trend_msg_compra(cierre, sma, dist, efectivo, btc, nop))
+        trend_update_summary(sh, dict(estado, estado="DENTRO", precio_entrada=round(cierre, 2),
+                                      btc_en_cartera=round(btc, 8), capital_efectivo=0,
+                                      num_operaciones=nop, ultima_comprobacion=ahora), cierre)
+        return f"COMPRA enviada a {cierre:.0f}."
+    trend_set_state(ws_estado, "ultima_comprobacion", ahora)
+    trend_update_summary(sh, dict(estado, ultima_comprobacion=ahora), cierre)
+    return f"sin cambio (FUERA, cierre {cierre:.0f}, dist {dist:+.2f}%)"
+
+
+@app.route("/trend_seed")
+def trend_seed_route():
+    if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
+        return "no autorizado", 403
+    try:
+        return trend_seed_sheets(), 200
+    except Exception as e:
+        log(f"[TENDENCIA][ERROR] seed: {e}")
+        return f"error: {e}", 500
+
+
+@app.route("/trend")
+def trend_route():
+    if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
+        return "no autorizado", 403
+    try:
+        res = do_trend_check()
+        log(f"[TENDENCIA] {res}")
+        return f"ok: {res}", 200
+    except Exception as e:
+        log(f"[TENDENCIA][ERROR] {e}")
+        return f"error: {e}", 500
+
+
+@app.route("/trend_test")
+def trend_test_route():
+    trend_send_telegram(
+        "✅ Prueba del Monitor de Tendencia.\n\n"
+        "Si ves este mensaje, el bot dedicado está bien configurado y aquí "
+        "recibirás las señales de COMPRA y VENTA.\n\nPuedes ignorar este mensaje."
+    )
+    return "Mensaje de prueba (tendencia) enviado a Telegram.", 200
+
+
 if __name__ == "__main__":
     # Para pruebas locales. En Render se arranca con gunicorn (ver Procfile).
     port = int(os.environ.get("PORT", 8080))
